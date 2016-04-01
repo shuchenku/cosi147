@@ -1,11 +1,16 @@
 package kvpaxos
 
 import "net/rpc"
-import "fmt"
+// import "fmt"
+import "strconv"
+import "math/rand"
+// import "log"
+// import "time"
 
 type Clerk struct {
   servers []string
   // You will have to modify this struct.
+  me string
 }
 
 
@@ -45,7 +50,7 @@ func call(srv string, rpcname string,
     return true
   }
 
-  fmt.Println(err)
+  // fmt.Println(err)
   return false
 }
 
@@ -56,7 +61,20 @@ func call(srv string, rpcname string,
 //
 func (ck *Clerk) Get(key string) string {
   // You will have to modify this function.
-  return ""
+  args := GetArgs{
+    Key: key,
+    Id: strconv.Itoa(rand.Int()),
+  }
+  reply := GetReply{}
+  for {
+    for _,server := range ck.servers {
+      ok := call(server,"KVPaxos.Get",args,&reply)
+      if ok { 
+        return reply.Value
+      }
+      // log.Printf("client get")
+    } 
+  }
 }
 
 //
@@ -65,7 +83,22 @@ func (ck *Clerk) Get(key string) string {
 //
 func (ck *Clerk) PutExt(key string, value string, dohash bool) string {
   // You will have to modify this function.
-  return ""
+  args := PutArgs{
+    Key: key,
+    Value: value,
+    DoHash: dohash,
+    Id: strconv.Itoa(rand.Int()),
+  }
+  reply := PutReply{}
+  for {
+    for _,server := range ck.servers {
+      ok := call(server,"KVPaxos.Put",args,&reply)
+      if ok { 
+        return reply.PreviousValue
+      }
+      // log.Printf("client put")
+    }
+  }
 }
 
 func (ck *Clerk) Put(key string, value string) {

@@ -10,6 +10,8 @@ import "os"
 import "syscall"
 import "encoding/gob"
 import "math/rand"
+import "time"
+// import "strconv"
 
 const Debug=0
 
@@ -25,6 +27,11 @@ type Op struct {
   // Your definitions here.
   // Field names must start with capital letters,
   // otherwise RPC will break.
+  Key string
+  Value string
+  Type string
+  Id string
+  DoHash bool
 }
 
 type KVPaxos struct {
@@ -36,19 +43,152 @@ type KVPaxos struct {
   px *paxos.Paxos
 
   // Your definitions here.
+  kvdb map[string]string
+  maxseq int
+  replies map[string]Op
 }
 
+func (kv *KVPaxos) wait(seq int) Op {
+  to := 10 * time.Millisecond
+  for {
+    decided, tmp := kv.px.Status(seq)
+    if decided {
+      return tmp.(Op)
+    }
+    // kv.maxseq++
+    time.Sleep(to)
+    if to < 10 * time.Second {
+      to *= 2
+    }
+  }
+}
 
 func (kv *KVPaxos) Get(args *GetArgs, reply *GetReply) error {
-  // Your code here.
+  kv.mu.Lock()
+  defer kv.mu.Unlock()
+  opargs := Op{
+    Key: args.Key,
+    Type: Get,
+    Id: args.Id,
+  }
+  var value Op
+  for {
+    prev,ok := kv.replies[args.Id]
+    if ok {
+      reply.Value = prev.Value
+      return nil
+    }
+
+    decided, tmp := kv.px.Status(kv.maxseq+1)
+    if decided {
+      value = tmp.(Op)
+    } else {
+      // kv.maxseq++
+      kv.px.Start(kv.maxseq+1,opargs)
+      value = kv.wait(kv.maxseq+1)
+
+    }
+    // log.Printf("kvpaxos: %v, getting: %v, supposed to be: %v, got: %v",kv.me,args.Key, args.Id, value.Id)
+    if value.Id == args.Id {
+      value.Value = kv.kvdb[value.Key]
+      kv.replies[value.Id] = value
+      // log.Printf("kvpaxos: %v, get reply: Key %v, Value %v, Type %v",kv.me,value.Key,value.Value,value.Type)
+      _,ex := kv.kvdb[args.Key]
+      if ex { 
+        reply.Value = kv.kvdb[args.Key]
+        // log.Printf("kvpaxos: %v, key: %v, value: %v, get successful", kv.me, args.Key, val)
+      }
+      kv.maxseq++ 
+      kv.px.Done(kv.maxseq) 
+      break
+    } else {
+    rep := kv.kvdb[value.Key]
+    if value.Type==Put {
+        if value.DoHash {
+          kv.kvdb[value.Key] = NextValue(kv.kvdb[value.Key], value.Value)
+        } else {
+          kv.kvdb[value.Key] = value.Value
+        }      
+        // log.Printf("kvpaxos: %v, put: catching up on seq: %v",kv.me,kv.maxseq)
+      } 
+      value.Value = rep
+      kv.replies[value.Id] = value
+    }
+    // kv.px.Done(kv.maxseq)
+    kv.maxseq++
+    kv.px.Done(kv.maxseq)
+    // log.Printf("get outer")    
+  }
   return nil
 }
 
 func (kv *KVPaxos) Put(args *PutArgs, reply *PutReply) error {
   // Your code here.
+  kv.mu.Lock()
+  defer kv.mu.Unlock()
+  opargs := Op{
+    Key: args.Key,
+    Value: args.Value,
+    Type: Put,
+    Id: args.Id,
+    DoHash: args.DoHash,
+  }
+  var value Op
+  for {
+    prev,ok := kv.replies[args.Id]
+    if ok {
+      reply.PreviousValue = prev.Value
+      return nil
+    }
 
+    decided, tmp := kv.px.Status(kv.maxseq+1)
+    if decided {
+      value = tmp.(Op)
+    } else {
+      // kv.maxseq++
+      kv.px.Start(kv.maxseq+1,opargs)
+      value = kv.wait(kv.maxseq+1)
+    }
+
+    // log.Printf("kvpaxos: %v, putting: key %v, value: %v ",kv.me,args.Key,args.Value)
+    if value.Id == args.Id {
+      reply.PreviousValue = kv.kvdb[args.Key]      
+      // val,ex := kv.kvdb[args.Key]
+      if args.DoHash {
+        // log.Printf("Has no key for %v, val: %v, test: %v",args.Key,val, val=="")
+        // log.Printf("kvpaxos: %v, key: %v, value: %v, put successful, overwritting", kv.me, args.Key, val)
+        kv.kvdb[args.Key] = NextValue(kv.kvdb[args.Key], value.Value)
+      } else {
+        kv.kvdb[args.Key] = args.Value
+      }
+      value.Value = reply.PreviousValue
+      kv.replies[value.Id] = value
+      kv.maxseq++ 
+      kv.px.Done(kv.maxseq) 
+      break
+    } else {
+      rep := kv.kvdb[value.Key]
+      if value.Type==Put {
+        if value.DoHash {
+          kv.kvdb[value.Key] = NextValue(kv.kvdb[value.Key], value.Value)
+        } else {
+          kv.kvdb[value.Key] = value.Value
+        }      
+        // log.Printf("kvpaxos: %v, put: catching up on seq: %v",kv.me,kv.maxseq)
+      } 
+      value.Value = rep
+      kv.replies[value.Id] = value
+    }
+    kv.maxseq++
+    kv.px.Done(kv.maxseq)
+  }
   return nil
 }
+
+// func NextValue(hprev string, val string) string {
+//   h := hash(hprev + val)
+//   return strconv.Itoa(int(h))
+// }
 
 // tell the server to shut itself down.
 // please do not change this function.
@@ -75,6 +215,11 @@ func StartServer(servers []string, me int) *KVPaxos {
   kv.me = me
 
   // Your initialization code here.
+
+  kv.replies = map[string]Op{}
+  kv.kvdb = map[string]string{}
+  kv.maxseq = 0
+
 
   rpcs := rpc.NewServer()
   rpcs.Register(kv)
@@ -123,4 +268,5 @@ func StartServer(servers []string, me int) *KVPaxos {
 
   return kv
 }
+
 
